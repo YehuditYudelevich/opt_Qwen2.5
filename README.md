@@ -140,6 +140,7 @@ Older, narrower scripts (still useful for quick isolated checks):
 
 ```bash
 python microbench.py           # kernel-level FP16 microbenchmarks
+python microbench_kernels.py   # INT8 kernel sweep: old vs new, BLOCK_K/num_warps
 python benchmark.py --runs 5   # end-to-end A/B/A, FP16 fused-MLP only
 python profile_model.py        # profile PyTorch baseline
 python profile_model.py --fused  # profile fused FP16 MLP

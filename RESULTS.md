@@ -89,18 +89,18 @@ matrices at once, not one at a time -- and measure both together.
 
 ---
 
-## Batch 1 (this session's code; **numbers below are PENDING** -- see note)
+## Batch 1 -- CONFIRMED on Tesla T4: target met
 
-> **This entire batch was implemented in an environment with no CUDA
-> GPU available.** Every hypothesis, implementation, and microbenchmark
-> claim in previous batches was graduated only after a real same-session
-> A/B/A run; that discipline is kept here by *not* filling in fake
-> numbers. The code is complete and self-tests its own correctness
-> gates, but the "end-to-end result" and "kept/rejected" columns below
-> are placeholders until `python run_t4_experiments.py` is actually run
-> on the Tesla T4 and its `results/run_<timestamp>.json` + summary table
-> are available. Update this section from that output, not from
-> expectation.
+Overall result reported back from a real Colab T4 run: baseline
+**~31.3 tok/s** -> optimized **~116 tok/s**, **~3.8x** end-to-end decode
+speedup, all correctness/quality gates passing. This is variant F
+(StaticCache + `torch.compile(mode="reduce-overhead")` + full INT8 with
+fused QKV/gate-up). The >=2x target from instructions.md is met.
+
+Per-variant (B/C/D/E individually, vs. F combined) breakdowns below are
+still marked PENDING -- only the combined/final number above has been
+reported back in enough detail to log here. Update the individual
+entries from a saved `results/run_<timestamp>.json` if/when available.
 
 Run with:
 
@@ -211,6 +211,77 @@ python run_t4_experiments.py --quick    # smoke test (~2 min) to sanity check th
 
 ---
 
+## Batch 2 (kernel-level rework of int8_gemv_kernel / fused_int8_gate_up_kernel; **numbers below are PENDING**)
+
+> Implemented in the same no-GPU environment as batch 1. The algorithm
+> change was verified by emulating it in plain PyTorch on CPU against
+> the existing `dequantize_int8_per_row` reference (max error ~1e-4 to
+> 1e-3, well inside the tolerances `test_correctness.py` already uses)
+> -- that confirms the math is right, not that it is faster. Actual
+> timing is PENDING `python microbench_kernels.py` (kernel-level,
+> includes a frozen copy of the pre-change kernel for a real before/
+> after) and `python run_t4_experiments.py` (end-to-end).
+
+Starting point: with the batch-1 stack at ~116 tok/s, profiling showed
+`int8_gemv_kernel` at ~38.5% of CUDA time and `fused_int8_gate_up_kernel`
+at ~33%.
+
+- Hypothesis: `BLOCK_K = triton.next_power_of_2(K)` combined with a
+  single masked load over the whole row wastes a large, computable
+  fraction of every GEMV on provably-zero padding, and holds that whole
+  padded width as live per-program registers. For this model's actual
+  K values: QKV-fused/O/lm_head (K=1536, BLOCK_K was 2048) waste 25%;
+  down_proj (K=8960, BLOCK_K was 16384) wastes 45.3% -- and
+  `int8_gemv_kernel` covers all four of those projections, which is
+  also why it outweighs the gate/up-only fused kernel in CUDA time.
+- Implementation (`kernels.py`):
+  1. Reworked both kernels to walk K in fixed `BLOCK_K=256`-wide tiles
+     (a Python-level, trace-time loop since K/BLOCK_K are
+     `tl.constexpr`) instead of one `next_pow2(K)`-wide masked load.
+     256 evenly divides both 1536 and 8960, so for this model the
+     compiled kernel now has zero masked/padded lanes; a masked
+     remainder tile is still generated for any K that doesn't divide
+     evenly, so arbitrary shapes stay correct.
+  2. Multiply in fp16 (weight dequantized to fp16, not fp32),
+     accumulating each tile's product into an fp32 running sum -- this
+     reproduces the "INT8 v2" change already validated in this
+     project's own history (instructions.md: 75.2us -> 71.1us from
+     exactly this change), which had regressed back to all-fp32 in the
+     batch-1 kernel.
+  3. `block_k`/`num_warps` exposed as keyword args on `int8_gemv()` /
+     `fused_int8_gate_up()` (default `DEFAULT_BLOCK_K=256`,
+     `DEFAULT_NUM_WARPS=4`, both new module constants in `kernels.py`)
+     so they can be swept without editing kernel code. Both wrapper
+     function signatures are otherwise unchanged -- `optimized_model.py`
+     and `test_correctness.py` call them positionally and need no
+     changes.
+- Deliberately NOT done, with reasoning:
+  - **`triton.autotune`**: would let the runtime pick `BLOCK_K`/
+    `num_warps` empirically, which is normally the right tool for
+    exactly this question. Rejected here because these kernels are
+    called from inside the `torch.compile(mode="reduce-overhead")`
+    CUDA-graph-captured decode step (variant F / `qwen_optimizer`'s
+    fast path) -- autotune's first-call dynamic benchmarking is not
+    safe to run from inside graph capture. Used a static default plus
+    an offline sweep script instead.
+  - **DP4A / INT8 tensor cores**: T4's native int8xint8 throughput
+    instructions require both operands to be int8; this scheme is
+    weight-only (activations stay fp16), so they don't apply without
+    also quantizing activations, which would change the quantization
+    semantics the task said to preserve. Also, at M=1 (batch=1 decode)
+    this is memory-bandwidth-bound, not compute-bound, so the multiply
+    representation is a second-order effect either way -- consistent
+    with (0.3)'s own historical numbers, where the fp16-vs-fp32
+    multiply change was worth ~5%, not a multiple.
+- Microbenchmark: **PENDING** `python microbench_kernels.py`.
+- End-to-end result: **PENDING** `python run_t4_experiments.py`.
+- Kept/rejected: **PENDING** -- only keep if the end-to-end run shows an
+  improvement over the ~116 tok/s batch-1 result; revert `kernels.py`
+  to the batch-1 version otherwise (frozen copy for comparison lives in
+  `microbench_kernels.py`).
+
+---
+
 ## How to fill this in
 
 After running `python run_t4_experiments.py` on the T4:
@@ -224,3 +295,7 @@ After running `python run_t4_experiments.py` on the T4:
    gate.
 3. If profiling was captured for the best variant, summarize what
    still dominates CUDA time and feed that into NEXT_STEPS.md.
+4. For batch 2 specifically: also run `python microbench_kernels.py`
+   first and paste its BEST BLOCK_K/num_warps per shape here before the
+   end-to-end run, so kernels.DEFAULT_BLOCK_K/DEFAULT_NUM_WARPS can be
+   corrected from data if 256/4 isn't actually fastest.
