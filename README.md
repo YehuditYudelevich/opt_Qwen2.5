@@ -1,4 +1,4 @@
-# Mini-DOS
+# opt-qwen
 
 Small-scale GPU inference optimization project inspired by the idea of a
 hardware-aware optimization stack.
