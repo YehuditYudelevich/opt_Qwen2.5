@@ -93,6 +93,8 @@ def greedy_decode_static(
     max_new_tokens,
     past_key_values,
     decode_step_fn=None,
+    eos_token_ids=None,
+    min_new_tokens=1,
 ):
     """
     Manual greedy loop using a caller-provided StaticCache (preallocated,
@@ -104,6 +106,12 @@ def greedy_decode_static(
     force recompilation every run).
 
     decode_step_fn(input_ids_1x1, cache_position_1, past_key_values) -> logits [1,1,V]
+
+    `eos_token_ids`, if given, stops generation as soon as a produced
+    token is a member (after at least `min_new_tokens` tokens), matching
+    `model.generate()`'s default early-stopping behavior. Both default
+    to the prior behavior (always generate exactly `max_new_tokens`)
+    when omitted, so existing callers are unaffected.
     """
     device = input_ids.device
     prompt_len = input_ids.shape[1]
@@ -120,25 +128,38 @@ def greedy_decode_static(
 
     generated = [input_ids, next_token]
     cur_pos = prompt_len
+    generated_count = 1
 
-    for _ in range(max_new_tokens - 1):
-        cache_position = torch.tensor([cur_pos], device=device, dtype=torch.long)
+    def _hit_eos():
+        return (
+            eos_token_ids is not None
+            and generated_count >= min_new_tokens
+            and next_token.item() in eos_token_ids
+        )
 
-        if decode_step_fn is not None:
-            logits = decode_step_fn(next_token, cache_position, past_key_values)
-        else:
-            out = model(
-                input_ids=next_token,
-                past_key_values=past_key_values,
-                use_cache=True,
-                cache_position=cache_position,
-                num_logits_to_keep=1,
-            )
-            logits = out.logits
+    if not _hit_eos():
+        for _ in range(max_new_tokens - 1):
+            cache_position = torch.tensor([cur_pos], device=device, dtype=torch.long)
 
-        next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
-        generated.append(next_token)
-        cur_pos += 1
+            if decode_step_fn is not None:
+                logits = decode_step_fn(next_token, cache_position, past_key_values)
+            else:
+                out = model(
+                    input_ids=next_token,
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                    cache_position=cache_position,
+                    num_logits_to_keep=1,
+                )
+                logits = out.logits
+
+            next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+            generated.append(next_token)
+            cur_pos += 1
+            generated_count += 1
+
+            if _hit_eos():
+                break
 
     return torch.cat(generated, dim=1)
 
@@ -166,3 +187,34 @@ def make_compiled_decode_step(model, fullgraph=True):
 
     compiled = torch.compile(_step, mode="reduce-overhead", fullgraph=fullgraph)
     return compiled
+
+
+def compile_decode_step_with_fallback(model, static_cache, warmup_input_ids, tag="compile", warmup_tokens=6, log=None):
+    """
+    Library version of the fallback cascade used in run_t4_experiments.py
+    (compile_with_fallback): tries torch.compile(mode="reduce-overhead")
+    with fullgraph=True, then fullgraph=False, then gives up and returns
+    a plain eager StaticCache step (decode_step_fn=None) -- never raises,
+    always returns a usable (possibly uncompiled) callable plus a label
+    saying honestly which mode was used.
+
+    `log`, if given, is called with each status line (e.g. `print`).
+    """
+
+    def _log(msg):
+        if log is not None:
+            log(msg)
+
+    for fullgraph in (True, False):
+        try:
+            step = make_compiled_decode_step(model, fullgraph=fullgraph)
+            static_cache.reset()
+            _ = greedy_decode_static(model, warmup_input_ids, warmup_tokens, static_cache, decode_step_fn=step)
+            torch.cuda.synchronize()
+            _log(f"[{tag}] torch.compile succeeded with fullgraph={fullgraph}")
+            return step, f"reduce-overhead(fullgraph={fullgraph})"
+        except Exception as e:
+            _log(f"[{tag}] torch.compile fullgraph={fullgraph} failed: {type(e).__name__}: {e}")
+
+    _log(f"[{tag}] torch.compile unavailable, falling back to eager StaticCache (no CUDA graph)")
+    return None, "eager_fallback (compile failed)"
