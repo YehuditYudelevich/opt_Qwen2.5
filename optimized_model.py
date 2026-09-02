@@ -30,17 +30,6 @@ import torch.nn as nn
 from kernels import int8_gemv, fused_int8_gate_up
 from quant import QuantizedWeightINT8, concat_quantized_rows
 
-# Opt-in, off-by-default diagnostic switch: when True, Int8QwenAttention
-# and Int8QwenMLP record the max-abs value of the activation fed into
-# o_proj / down_proj on each call (`self.last_o_proj_input_max_abs` /
-# `self.last_down_proj_input_max_abs`). These two are exactly the
-# decode-path activations that are NOT freshly RMSNorm'd, which is what
-# made them the actual site of a real fp16-overflow bug (see
-# debug_int8_nan.py, kernels.py). Left False in normal operation since
-# `.abs().max().item()` is a synchronizing op this project has otherwise
-# worked hard to avoid on the hot path.
-DEBUG_ACTIVATION_STATS = False
-
 try:
     from transformers.models.qwen2.modeling_qwen2 import (
         apply_rotary_pos_emb,
@@ -182,9 +171,6 @@ class Int8QwenAttention(nn.Module):
 
         attn_output = attn_output.transpose(1, 2).contiguous().reshape(-1)
 
-        if DEBUG_ACTIVATION_STATS:
-            self.last_o_proj_input_max_abs = attn_output.abs().max().item()
-
         out = int8_gemv(attn_output, self.o_weight.qweight, self.o_weight.scale)
         out = out.view(1, 1, self.hidden_size)
 
@@ -233,9 +219,6 @@ class Int8QwenMLP(nn.Module):
             self.up_weight.qweight,
             self.up_weight.scale,
         )
-
-        if DEBUG_ACTIVATION_STATS:
-            self.last_down_proj_input_max_abs = hidden.abs().max().item()
 
         out = int8_gemv(hidden, self.down_weight.qweight, self.down_weight.scale)
         return out.view(1, 1, self.hidden_size)
