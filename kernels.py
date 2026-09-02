@@ -213,11 +213,20 @@ def int8_gemv_kernel(
     generates no code at all, i.e. no masked loads anywhere. Arbitrary
     K still works correctly via the masked remainder tile.
 
-    The multiply is done with the weight dequantized to fp16 (not
-    fp32), accumulating the per-tile products in fp32 -- this matches
-    the "INT8 v2" kernel already validated in this project's history
-    (instructions.md: fp16-multiply/fp32-accumulate measured 75.2us ->
-    71.1us over an all-fp32 version).
+    The multiply-accumulate is done in fp32, NOT fp16. An earlier
+    version of this kernel multiplied in fp16 to match the "INT8 v2"
+    precedent in instructions.md, but that measured a real NaN in the
+    end-to-end INT8 quality gate: the scale is applied once, after the
+    full reduction, so every per-tile product is `x * raw_int8_value`
+    (the RAW, unscaled weight byte, range [-127, 127]) -- computed in
+    fp16 (max ~65504), any activation with |x| > ~515 overflows to inf
+    the instant it's multiplied by a 127-valued byte, before the fp32
+    accumulator ever sees it. Isolated kernel tests never caught this
+    because they use unit-variance synthetic activations; real
+    unnormalized activations (attention output before o_proj,
+    SiLU(gate)*up before down_proj) exceed that threshold. fp32 has
+    enough headroom (~3.4e38) that this was never an issue before the
+    fp16 change, and is the numerically safe choice here.
     """
     row = tl.program_id(0)
     offs_base = tl.arange(0, BLOCK_K)
@@ -229,16 +238,16 @@ def int8_gemv_kernel(
 
     for tile in range(num_full_tiles):
         offs = tile * BLOCK_K + offs_base
-        x = tl.load(x_ptr + offs)
-        w = tl.load(qw_ptr + row * K + offs).to(tl.float16)
-        acc += (x * w).to(tl.float32)
+        x = tl.load(x_ptr + offs).to(tl.float32)
+        w = tl.load(qw_ptr + row * K + offs).to(tl.float32)
+        acc += x * w
 
     if remainder > 0:
         offs = num_full_tiles * BLOCK_K + offs_base
         mask = offs_base < remainder
-        x = tl.load(x_ptr + offs, mask=mask, other=0.0)
-        w = tl.load(qw_ptr + row * K + offs, mask=mask, other=0).to(tl.float16)
-        acc += (x * w).to(tl.float32)
+        x = tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+        w = tl.load(qw_ptr + row * K + offs, mask=mask, other=0).to(tl.float32)
+        acc += x * w
 
     scale = tl.load(scale_ptr + row)
     result = tl.sum(acc, axis=0) * scale
@@ -318,11 +327,13 @@ def fused_int8_gate_up_kernel(
 
     Same K-tiling rework as int8_gemv_kernel (see its docstring): walks
     K in BLOCK_K-sized tiles instead of one BLOCK_K=next_pow2(K)-wide
-    masked load, and multiplies in fp16 with fp32 accumulation. For
-    this model's K=1536, the default BLOCK_K=256 divides evenly (6
-    tiles, no masking) versus the old BLOCK_K=2048 which wasted 25% of
-    every call on masked-zero lanes -- doubled here since gate and up
-    are both affected per call.
+    masked load. The multiply-accumulate is fp32, NOT fp16 -- see
+    int8_gemv_kernel's docstring for why: multiplying an activation by
+    a RAW (unscaled, up to +-127) int8 weight byte in fp16 overflows
+    for any |x| above ~515, which real (RMSNorm-scaled, potentially
+    outlier) activations can exceed even though synthetic unit-variance
+    test inputs never do. Measured as a real end-to-end NaN in the
+    int8_quality gate; fp32's headroom makes it a non-issue.
     """
     row = tl.program_id(0)
     offs_base = tl.arange(0, BLOCK_K)
@@ -335,20 +346,20 @@ def fused_int8_gate_up_kernel(
 
     for tile in range(num_full_tiles):
         offs = tile * BLOCK_K + offs_base
-        x = tl.load(x_ptr + offs)
-        gate_w = tl.load(gate_qw_ptr + row * K + offs).to(tl.float16)
-        up_w = tl.load(up_qw_ptr + row * K + offs).to(tl.float16)
-        gate_acc += (x * gate_w).to(tl.float32)
-        up_acc += (x * up_w).to(tl.float32)
+        x = tl.load(x_ptr + offs).to(tl.float32)
+        gate_w = tl.load(gate_qw_ptr + row * K + offs).to(tl.float32)
+        up_w = tl.load(up_qw_ptr + row * K + offs).to(tl.float32)
+        gate_acc += x * gate_w
+        up_acc += x * up_w
 
     if remainder > 0:
         offs = num_full_tiles * BLOCK_K + offs_base
         mask = offs_base < remainder
-        x = tl.load(x_ptr + offs, mask=mask, other=0.0)
-        gate_w = tl.load(gate_qw_ptr + row * K + offs, mask=mask, other=0).to(tl.float16)
-        up_w = tl.load(up_qw_ptr + row * K + offs, mask=mask, other=0).to(tl.float16)
-        gate_acc += (x * gate_w).to(tl.float32)
-        up_acc += (x * up_w).to(tl.float32)
+        x = tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+        gate_w = tl.load(gate_qw_ptr + row * K + offs, mask=mask, other=0).to(tl.float32)
+        up_w = tl.load(up_qw_ptr + row * K + offs, mask=mask, other=0).to(tl.float32)
+        gate_acc += x * gate_w
+        up_acc += x * up_w
 
     gate_scale = tl.load(gate_scale_ptr + row)
     up_scale = tl.load(up_scale_ptr + row)

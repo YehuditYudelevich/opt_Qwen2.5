@@ -6,34 +6,55 @@ Batch 1 target met: ~31.3 -> ~116 tok/s (~3.8x) on Tesla T4, variant F
 (StaticCache + `torch.compile(reduce-overhead)` + full INT8), all
 correctness/quality gates passing. See RESULTS.md "Batch 1".
 
-## Immediate action: validate batch 2 (kernel rework)
+## Immediate action: verify the batch-2 NaN fix, correctness FIRST
 
-Profiling of the batch-1 result showed `int8_gemv_kernel` at ~38.5% of
-CUDA time and `fused_int8_gate_up_kernel` at ~33%. Both kernels were
-reworked in `kernels.py` (tiled K-loop instead of a `next_pow2(K)`-wide
-masked load, fp16 multiply / fp32 accumulate) -- see RESULTS.md
-"Batch 2" for the full reasoning. Run, in order:
+The first batch-2 attempt (tiling + fp16 multiply) produced a real
+`perplexity_int8 = NaN` on the T4, root-caused to overflow: the fp16
+multiply used the RAW unscaled int8 weight byte (range +-127) against
+the real activation, before the dequant scale was applied -- any
+activation channel with `|x| > ~515` overflows fp16 (confirmed by
+direct CPU reproduction: `800 * int8(127)` -> `inf` in fp16, `101600`
+in fp32). Isolated kernel tests never caught it because they use
+unit-variance synthetic activations, not real (unnormalized, sometimes
+outlier) ones. See RESULTS.md "Batch 2, 2.1" for the full writeup.
+
+Fix applied (RESULTS.md "2.2"): kept the tiled/no-masked-waste loop,
+reverted the multiply to fp32 (matching the batch-1 kernel's numerics
+exactly). Verified so far only via CPU emulation (matches reference to
+~1e-4 to 1e-3 error; the exact forced-overflow case that broke 2.1 now
+produces a finite result). **Not yet run on the T4.** Run, strictly in
+this order -- do not skip ahead to benchmarking:
 
 ```bash
-python test_correctness.py       # CPU-safe quant-math check, should still pass
-python microbench_kernels.py     # kernel-level: old vs new + BLOCK_K/num_warps sweep, per real shape
-python run_t4_experiments.py     # end-to-end same-session A/B/A, decides keep/reject
+python test_correctness.py       # must pass, especially int8_quality (no NaN), before anything else below
+python debug_int8_nan.py         # optional: if anything still looks off, pinpoints which layer/module
+python microbench_kernels.py     # only after int8_quality passes: kernel-level old vs new + BLOCK_K/num_warps sweep
+python run_t4_experiments.py     # only after int8_quality passes: end-to-end same-session A/B/A
 ```
 
 Report back:
-1. `microbench_kernels.py`'s per-shape "BEST" line (confirms whether
-   `DEFAULT_BLOCK_K=256`/`DEFAULT_NUM_WARPS=4` in `kernels.py` are
-   actually fastest, or should change).
-2. Whether `test_correctness.py`'s CUDA-dependent tests
-   (`int8_gemv_kernel[*]`, `fused_int8_gate_up_kernel`, `int8_quality`)
-   still pass -- the math changed (tiling, fp16 multiply), so this is
-   the real correctness gate, not the CPU-safe subset.
-3. `run_t4_experiments.py`'s end-to-end tok/s vs the ~116 tok/s
-   baseline. Keep the kernel change only if this improves; otherwise
-   revert `kernels.py` (the pre-change kernel is preserved verbatim in
-   `microbench_kernels.py` for comparison and as a rollback reference).
+1. Whether `test_correctness.py`'s CUDA-dependent tests -- especially
+   `int8_quality` -- pass (no NaN/inf, top-1 agreement/perplexity ratio
+   within the existing thresholds). **If not, stop here and report
+   back; do not run the benchmarks.**
+2. If it passes: `microbench_kernels.py`'s per-shape "BEST" line
+   (confirms whether `DEFAULT_BLOCK_K=256`/`DEFAULT_NUM_WARPS=4` are
+   actually fastest) and `run_t4_experiments.py`'s end-to-end tok/s vs
+   the ~116 tok/s baseline. Keep the kernel change only if this
+   improves; otherwise revert `kernels.py` to git commit `ff64322` (the
+   exact kernel that produced the confirmed ~116 tok/s result) -- also
+   preserved verbatim in `microbench_kernels.py` for comparison.
 
-## If the kernel rework doesn't move end-to-end tok/s
+## If int8_quality still fails after the fp32 revert
+
+Then the fp16-overflow theory was incomplete or something else is also
+wrong. Run `debug_int8_nan.py` (hooks every layer's
+self_attn/mlp/lm_head for inf/nan, plus reports max-abs activation into
+o_proj/down_proj per layer via `optimized_model.DEBUG_ACTIVATION_STATS`)
+and report exactly which layer/module it flags -- don't re-guess at the
+arithmetic again without that data.
+
+## If the kernel rework (once passing) doesn't move end-to-end tok/s
 
 That would mean `int8_gemv_kernel`'s 38.5% was dominated by something
 other than masked-lane waste (e.g. launch count/occupancy rather than
