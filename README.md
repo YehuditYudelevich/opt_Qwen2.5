@@ -13,6 +13,11 @@ NVIDIA Tesla T4 GPU and target:
 The project deliberately focuses on understanding and implementing low-level
 optimizations rather than producing an artificial benchmark win.
 
+**Status: target met.** INT8 weight-only quantization + fused Triton
+kernels + StaticCache + `torch.compile` CUDA graphs measured ~3.75x
+end-to-end decode throughput on Tesla T4, same-session A/B/A. See
+[RESULTS.md](RESULTS.md).
+
 ## Current target
 
 - Model: `Qwen/Qwen2.5-1.5B-Instruct`
@@ -94,6 +99,26 @@ Triton kernel arithmetic vs. a PyTorch reference, manual-loop token-exact
 match against `generate()`, and INT8 quality via perplexity delta +
 greedy-continuation token overlap, not a single `allclose` call.
 
+## Reusable API
+
+The optimizations above are packaged behind one call:
+
+```python
+from qwen_optimizer import optimize
+
+model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-1.5B-Instruct", torch_dtype=torch.float16, device_map="cuda")
+model = optimize(model)
+
+output = model.generate(**inputs, do_sample=False, max_new_tokens=64)
+```
+
+`optimize()` installs the INT8/Triton/StaticCache/compile path and wraps
+`generate()` so supported greedy, batch=1 calls use it automatically
+(including early stopping on EOS, like normal `generate()`); sampling,
+beam search, batch>1, or anything else it isn't confident about
+transparently falls back to the original HF `generate()`. Safe to call
+more than once. See `qwen_optimizer/core.py` and `test_qwen_optimizer.py`.
+
 ## Usage
 
 Install:
@@ -119,6 +144,7 @@ python benchmark.py --runs 5   # end-to-end A/B/A, FP16 fused-MLP only
 python profile_model.py        # profile PyTorch baseline
 python profile_model.py --fused  # profile fused FP16 MLP
 python test_correctness.py     # CPU-only quantization-math sanity check
+python test_qwen_optimizer.py  # qwen_optimizer package: optimize()/generate()/fallback checks
 ```
 
 ## Rules for future optimization work
