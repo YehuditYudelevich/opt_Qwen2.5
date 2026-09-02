@@ -1,0 +1,39 @@
+{
+  "hardware": {
+    "gpu": "NVIDIA Tesla T4",
+    "compute_capability": "7.5"
+  },
+  "model": {
+    "name": "Qwen/Qwen2.5-1.5B-Instruct",
+    "precision": "FP16",
+    "layers": 28,
+    "hidden_size": 1536,
+    "mlp_intermediate_size": 8960
+  },
+  "initial_baseline": {
+    "median_tokens_per_sec": 28.52,
+    "median_ms_per_token": 35.08,
+    "peak_vram_gb": 2.89,
+    "note": "Colab performance drifted later; use A/B/A for future claims."
+  },
+  "gemv_1536_to_8960": {
+    "pytorch_us": 160.86,
+    "triton_us": 111.57,
+    "speedup": 1.44,
+    "correct": true
+  },
+  "fused_gate_up_silu_mul": {
+    "pytorch_us": 431.0,
+    "triton_us": 213.42,
+    "speedup": 2.02,
+    "correct": true
+  },
+  "fused_mlp_end_to_end": {
+    "pytorch_a_tokens_per_sec": 21.0,
+    "fused_tokens_per_sec": 22.22,
+    "pytorch_b_tokens_per_sec": 22.4,
+    "baseline_average_tokens_per_sec": 21.7,
+    "speedup": 1.024,
+    "improvement_percent": 2.4
+  }
+}
