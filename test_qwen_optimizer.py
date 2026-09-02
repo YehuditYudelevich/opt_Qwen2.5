@@ -61,7 +61,18 @@ def test_optimize_is_idempotent(model):
 
 
 def test_optimized_generate_runs(model, tokenizer, max_new_tokens=16):
-    """The optimized generate() must produce a well-formed greedy continuation."""
+    """
+    The optimized generate() must produce a well-formed greedy
+    continuation. Length must be between prompt_len+1 and
+    prompt_len+max_new_tokens inclusive -- the decode loop's EOS
+    handling (decode_loop.greedy_decode_static's eos_token_ids) is
+    expected to stop generation early, exactly like real
+    model.generate() does, so a shorter-than-max output is correct, not
+    a bug. When it IS shorter, the last token must actually be an EOS
+    id, otherwise something other than EOS cut it short.
+    """
+    from qwen_optimizer.core import _resolve_eos_and_min
+
     inputs = _chat_inputs(tokenizer, model, "Say hello in one short sentence.")
     prompt_len = inputs["input_ids"].shape[1]
 
@@ -69,14 +80,26 @@ def test_optimized_generate_runs(model, tokenizer, max_new_tokens=16):
         **inputs, max_new_tokens=max_new_tokens, do_sample=False, num_beams=1, use_cache=True
     )
 
-    ok = output.shape[0] == 1 and output.shape[1] == prompt_len + max_new_tokens
+    output_len = output.shape[1]
+    length_in_range = prompt_len + 1 <= output_len <= prompt_len + max_new_tokens
+
+    eos_token_ids, _ = _resolve_eos_and_min(model, {})
+    stopped_early = output_len < prompt_len + max_new_tokens
+    last_token = int(output[0, -1].item())
+    early_stop_is_eos = not stopped_early or (eos_token_ids is not None and last_token in eos_token_ids)
+
+    ok = output.shape[0] == 1 and length_in_range and early_stop_is_eos
     return [
         {
             "name": "optimized_generate_runs",
             "passed": bool(ok),
             "details": {
                 "output_shape": list(output.shape),
-                "expected_len": prompt_len + max_new_tokens,
+                "prompt_len": prompt_len,
+                "max_len": prompt_len + max_new_tokens,
+                "stopped_early": stopped_early,
+                "last_token": last_token,
+                "eos_token_ids": sorted(eos_token_ids) if eos_token_ids else None,
             },
         }
     ]
