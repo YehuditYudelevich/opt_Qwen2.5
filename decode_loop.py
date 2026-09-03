@@ -95,6 +95,7 @@ def greedy_decode_static(
     decode_step_fn=None,
     eos_token_ids=None,
     min_new_tokens=1,
+    eos_check_interval=1,
 ):
     """
     Manual greedy loop using a caller-provided StaticCache (preallocated,
@@ -112,6 +113,16 @@ def greedy_decode_static(
     `model.generate()`'s default early-stopping behavior. Both default
     to the prior behavior (always generate exactly `max_new_tokens`)
     when omitted, so existing callers are unaffected.
+
+    `eos_check_interval` trades early-stop precision for fewer
+    CPU<->GPU synchronizations: checking the produced token against
+    eos_token_ids requires `.item()`, a blocking device->host read, on
+    every step it runs. The default, 1, checks every step (identical to
+    the original behavior -- generation stops at the exact same token
+    `model.generate()` would). A value > 1 only checks every Nth step,
+    reducing sync frequency by that factor at the cost of generating up
+    to `eos_check_interval - 1` extra tokens past the true stopping
+    point before noticing. Only takes effect when eos_token_ids is set.
     """
     device = input_ids.device
     prompt_len = input_ids.shape[1]
@@ -134,12 +145,22 @@ def greedy_decode_static(
         return (
             eos_token_ids is not None
             and generated_count >= min_new_tokens
+            and generated_count % eos_check_interval == 0
             and next_token.item() in eos_token_ids
         )
 
+    # Reused every step and updated in place via .fill_() below, instead of
+    # constructing a fresh torch.tensor([cur_pos], device=...) each
+    # iteration. The old per-step construction allocates a CPU tensor,
+    # allocates a GPU tensor, and issues a host-to-device memcpy every
+    # single decode step; .fill_(python_int) passes the scalar as a
+    # kernel launch argument directly, no separate allocation or copy.
+    # Output-identical (same integer value at the same step either way).
+    cache_position = torch.empty(1, device=device, dtype=torch.long)
+
     if not _hit_eos():
         for _ in range(max_new_tokens - 1):
-            cache_position = torch.tensor([cur_pos], device=device, dtype=torch.long)
+            cache_position.fill_(cur_pos)
 
             if decode_step_fn is not None:
                 logits = decode_step_fn(next_token, cache_position, past_key_values)

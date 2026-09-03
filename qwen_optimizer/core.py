@@ -87,7 +87,7 @@ def _validate_architecture(model):
         raise ValueError("Expected the model to expose `lm_head`.")
 
 
-def optimize(model, use_compile: bool = True):
+def optimize(model, use_compile: bool = True, eos_check_interval: int = 1):
     """
     Installs the existing INT8 Triton decode path onto `model` and wraps
     `model.generate()` so supported greedy, batch=1 calls automatically
@@ -98,6 +98,17 @@ def optimize(model, use_compile: bool = True):
     `use_compile=False` skips the torch.compile step (eager StaticCache
     only) -- useful if compilation is flaky in a given environment; the
     INT8/StaticCache speedup still applies.
+
+    `eos_check_interval` (default 1, i.e. unchanged behavior): every
+    optimized generate() call resolves a real eos_token_id from the
+    model's own config, so decode_loop.greedy_decode_static's early-stop
+    check -- which requires a blocking `.item()` device->host read --
+    runs every single decode step by default. Passing a value > 1 checks
+    every Nth step instead, trading up to `eos_check_interval - 1` extra
+    generated tokens past the true stop point for fewer synchronizations.
+    See decode_loop.greedy_decode_static's docstring for the full
+    tradeoff. Left at 1 unless a measured benchmark justifies raising it
+    for your workload.
 
     Safe to call more than once: later calls are a no-op and return the
     same model instance.
@@ -125,6 +136,7 @@ def optimize(model, use_compile: bool = True):
         compiled_mode="not attempted",
         max_cache_len=0,
         use_compile=use_compile,
+        eos_check_interval=eos_check_interval,
     )
 
     saved_original_generate = model.generate
@@ -236,6 +248,7 @@ def _route_generate(model, state, saved_original_generate, args, kwargs):
             decode_step_fn=state.compiled_step,
             eos_token_ids=eos_token_ids,
             min_new_tokens=min_new_tokens,
+            eos_check_interval=state.eos_check_interval,
         )
     finally:
         optimized_model.set_int8(model, False)

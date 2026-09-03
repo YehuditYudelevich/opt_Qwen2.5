@@ -89,18 +89,22 @@ matrices at once, not one at a time -- and measure both together.
 
 ---
 
-## Batch 1 (this session's code; **numbers below are PENDING** -- see note)
+## Batch 1 -- CONFIRMED on Tesla T4: target met
 
-> **This entire batch was implemented in an environment with no CUDA
-> GPU available.** Every hypothesis, implementation, and microbenchmark
-> claim in previous batches was graduated only after a real same-session
-> A/B/A run; that discipline is kept here by *not* filling in fake
-> numbers. The code is complete and self-tests its own correctness
-> gates, but the "end-to-end result" and "kept/rejected" columns below
-> are placeholders until `python run_t4_experiments.py` is actually run
-> on the Tesla T4 and its `results/run_<timestamp>.json` + summary table
-> are available. Update this section from that output, not from
-> expectation.
+Overall result reported back from a real Colab T4 run: baseline
+**~31.3 tok/s** -> optimized **~116 tok/s**, **~3.8x** end-to-end decode
+speedup, all correctness/quality gates passing (variant F: StaticCache +
+`torch.compile(reduce-overhead)` + full INT8 with fused QKV/gate-up).
+The >=2x target from instructions.md is met. Per-variant (B/C/D/E vs F)
+breakdowns below are still marked PENDING -- only the combined/final
+number has been reported back in enough detail to log here.
+
+> The rest of this section was written in an environment with no CUDA
+> GPU available, before the confirmation above existed. Every
+> hypothesis/implementation claim in previous batches was graduated only
+> after a real same-session A/B/A run; that discipline is kept here by
+> *not* filling in fake per-variant numbers. Update the PENDING entries
+> below from a saved `results/run_<timestamp>.json` if/when available.
 
 Run with:
 
@@ -211,6 +215,109 @@ python run_t4_experiments.py --quick    # smoke test (~2 min) to sanity check th
 
 ---
 
+## Batch 3 (profiling-methodology pass, inspired by vLLM issue #421; **numbers PENDING**)
+
+vLLM issue #421 ("+34% higher throughput?") used Nsight Compute/Systems
+to find three concrete bottlenecks in vLLM's own code: a hand-written
+attention kernel re-reading the query vector from global memory once
+per thread instead of once per block (15% compute / 50% bandwidth
+utilization), per-sequence `torch.multinomial` sampling in a Python
+loop leaving the GPU idle ~50% of the time, and per-item `.item()`
+reads of logprobs causing many tiny GPU->CPU transfers. Fixing all
+three: 4.02 -> 5.41 req/s (1.34x) on their setup.
+
+This batch applies that *methodology* (profile for redundant memory
+traffic, idle-GPU stretches, and small repeated CPU<->GPU round trips)
+to our own code, not their code -- most of it doesn't transfer:
+
+- **Redundant attention/KV-cache global-memory loads**: N/A. We have no
+  hand-written attention kernel; attention runs through PyTorch's
+  `scaled_dot_product_attention`, and it has never shown up as a
+  meaningful share of CUDA time in any profiling run in this project
+  (batch 0 or batch 1). Nothing to fix; re-flagging it would be
+  inventing a problem this architecture doesn't have.
+- **Per-sequence sampling batching**: N/A as stated. We're greedy,
+  batch=1 -- a single `.argmax()` call, already one vectorized op, no
+  Python loop over sequences to batch.
+- **Low SM occupancy / warp stalls**: not checked here -- real analysis
+  needs Nsight Compute (`ncu`), which needs a GPU this environment
+  doesn't have. See NEXT_STEPS.md for the exact `ncu` command to run
+  against `int8_gemv_kernel`/`fused_int8_gate_up_kernel`.
+- **Unnecessary GPU<->CPU synchronization / per-token Python overhead**:
+  found two real, present-in-our-own-code instances, both in
+  `decode_loop.greedy_decode_static` -- see 3.1 and 3.2 below.
+
+### 3.1 Persistent cache_position buffer (Fix 1)
+
+- Hypothesis: `cache_position = torch.tensor([cur_pos], device=device,
+  dtype=torch.long)` was reconstructed from a Python int every single
+  decode step -- a CPU tensor allocation, a GPU tensor allocation, and
+  a host-to-device memcpy, every step, when the value only ever needs
+  one GPU-resident scalar buffer updated in place.
+- Implementation: allocate the buffer once (`torch.empty(1, ...)`)
+  before the loop, `.fill_(cur_pos)` each iteration instead of
+  reconstructing. Purely internal to `greedy_decode_static` -- no
+  signature change, so every existing caller (`test_correctness.py`,
+  `run_t4_experiments.py`, `qwen_optimizer/core.py`) is unaffected by
+  construction, not just by convention.
+- Correctness: output-identical by design (same integer value fed at
+  the same step either way). Verified two ways without a GPU: (a) a
+  pure-Python simulation of the old vs. new position-value sequence
+  across several (prompt_len, max_new_tokens) combinations, including
+  edge cases max_new_tokens=1 and =2 -- all matched exactly; (b)
+  `bench_decode_overhead.py`'s section B asserts `torch.equal()` between
+  a frozen verbatim copy of the pre-fix function and the current one
+  before it trusts any timing from either.
+- Microbenchmark: **PENDING** `python bench_decode_overhead.py`
+  (section A: raw `torch.tensor()` vs `.fill_()` cost in isolation;
+  section B: same real decode loop, before vs after, `eos_token_ids`
+  disabled in both so this is isolated from 3.2).
+- End-to-end result: **PENDING**.
+- Kept/rejected: **PENDING** -- but note this one has no
+  correctness/behavior trade-off (output-identical), so "keep" here
+  only depends on whether it measurably helps, not on any downside.
+
+### 3.2 Configurable eos_check_interval (Fix 2)
+
+- Hypothesis: `_hit_eos()` calls `next_token.item()` -- a blocking
+  device->host read -- every decode step whenever `eos_token_ids` is
+  set. `qwen_optimizer.optimize()`'s wrapped `generate()` *always*
+  resolves a real `eos_token_id` from the model's own config (Qwen
+  models always have one), so **every call through the packaged API
+  pays this every step**. Critically, `run_t4_experiments.py` -- the
+  harness that produced the confirmed ~116 tok/s -- calls
+  `greedy_decode_static` without `eos_token_ids` at all, so this cost
+  was never present in that measurement. It is real, previously
+  unmeasured overhead specific to the public API surface.
+- Implementation: added `eos_check_interval` (default `1`) to
+  `greedy_decode_static` -- only checks EOS every Nth generated token
+  instead of every token, trading up to `eos_check_interval - 1` extra
+  generated tokens past the true stop point for fewer syncs. Default of
+  1 makes `generated_count % 1 == 0` always true, i.e. behavior is
+  byte-for-byte identical to before unless a caller opts in to a larger
+  value. Plumbed through as an optional `optimize(model,
+  eos_check_interval=1)` kwarg on the public API, also defaulting to
+  the unchanged value.
+- Correctness: verified the default (`interval=1`) produces identical
+  stop decisions to the pre-existing (uninterval'd) logic across a
+  swept range of `generated_count`/`min_new_tokens` combinations,
+  without a GPU. A value > 1 is a *deliberate, bounded, documented*
+  behavior change (later stopping by up to N-1 tokens), not a
+  correctness bug -- it is off by default specifically so nobody gets
+  this trade-off without asking for it.
+- Microbenchmark: **PENDING** `python bench_decode_overhead.py` section
+  C (interval in {1,4,8,16}, real model, natural EOS stopping, reports
+  both wall time and generated-token-count overshoot together so the
+  speed/precision trade-off is visible in one place, not just the speed
+  side).
+- End-to-end result: **PENDING**.
+- Kept/rejected: **PENDING** -- and unlike 3.1, "keep" here is a policy
+  decision even if it helps: only worth raising the *default* above 1 if
+  the measured sync cost is large AND the bounded overshoot is
+  acceptable for real usage. Until measured, the default stays 1.
+
+---
+
 ## How to fill this in
 
 After running `python run_t4_experiments.py` on the T4:
@@ -224,3 +331,12 @@ After running `python run_t4_experiments.py` on the T4:
    gate.
 3. If profiling was captured for the best variant, summarize what
    still dominates CUDA time and feed that into NEXT_STEPS.md.
+4. For batch 3: run `python bench_decode_overhead.py`, paste sections
+   A/B/C's numbers into 3.1/3.2 above, and run an end-to-end check
+   (`bench_vs_vllm.py --engine ours` before/after touching
+   `eos_check_interval`, or a same-session A/B/A like earlier batches)
+   before marking either kept. If 3.1 or 3.2 make end-to-end tok/s
+   worse, revert them -- 3.1 has no correctness trade-off so reverting
+   it only costs the (apparently negative) speed change; 3.2 defaults
+   to `eos_check_interval=1` already, so "reject" just means never
+   recommending a larger value, no revert needed.
